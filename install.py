@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Aksho Comfy for Mac, originally written by bdotnet. MIT licensed, see LICENSE.
 """Aksho Comfy installer for Apple Silicon.
 
 Same job as the Windows install.ps1: read manifest.json from dl.akshoai.com,

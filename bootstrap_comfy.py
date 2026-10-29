@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Aksho Comfy for Mac, originally written by bdotnet. MIT licensed, see LICENSE.
 """Install the Mac ComfyUI runtime into an Aksho Comfy folder.
 
 The Windows bundle downloads comfyui-portable.zip (embedded CPython plus a

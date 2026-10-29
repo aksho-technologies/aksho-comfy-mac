@@ -1,3 +1,4 @@
+# Aksho Comfy for Mac, originally written by bdotnet. MIT licensed, see LICENSE.
 # Finder opens .command files with a minimal PATH (/usr/bin:/bin).
 # uv lives in ~/.local/bin, Homebrew git in /opt/homebrew/bin, and this
 # machine's Python 3.13 is a pyenv version. Put those in front.
