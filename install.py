@@ -62,12 +62,12 @@ LAUNCHER_NAMES = (
     "mac-env.sh",
 )
 # fp8 text encoders crash on MPS with ComfyUI v0.38.0 (no float8 kernels).
-OFF_BY_DEFAULT = {"z-image", "krea2"}
 PACK_NOTES = {
-    "multi": "RES4LYF in this pack calls CUDA directly. Some multi-character workflows will fail on Mac until that is patched.",
     "z-image": "FP8 text encoder. ComfyUI v0.38.0 cannot run float8 math on Metal. Leave this off.",
     "krea2": "FP8 text encoder. Same Metal limit as Z-Image. Leave this off.",
 }
+# The checkpoint --yes installs on a first run: the one this port was tested on.
+YES_BASE = "base-2-5d"
 
 LOG_PATH: Path | None = None
 
@@ -188,36 +188,114 @@ def pack_download_bytes(pack: dict, components: dict[str, dict]) -> int:
     return total
 
 
+def first_run_pack_ids(manifest: dict) -> list[str]:
+    """The tools that work with every model. A checkpoint picked brings the rest."""
+    return [pack["id"] for pack in manifest["packs"] if pack.get("tier") == "recommended" and not pack.get("worksWith")]
+
+
+def with_supports(manifest: dict, pack_ids: list[str], first_run: bool) -> list[str]:
+    """A checkpoint or tool brings the model support it runs on, when none of its
+    own is in yet. On a first run a checkpoint also brings the recommended tools
+    made for its model."""
+    packs = {pack["id"]: pack for pack in manifest["packs"]}
+    chosen = list(dict.fromkeys(pack_ids))
+    for pack_id in list(chosen):
+        needs = packs.get(pack_id, {}).get("worksWith") or []
+        if needs and not any(need in chosen for need in needs):
+            chosen.append(needs[0])
+        if first_run and packs.get(pack_id, {}).get("tier") == "base":
+            for tool in manifest["packs"]:
+                if tool.get("tier") == "recommended" and any(need in (tool.get("worksWith") or []) for need in needs):
+                    chosen.append(tool["id"])
+    return list(dict.fromkeys(chosen))
+
+
 def default_pack_ids(manifest: dict) -> list[str]:
-    chosen = []
-    for pack in manifest["packs"]:
-        if pack.get("required") or pack["id"] not in OFF_BY_DEFAULT:
-            chosen.append(pack["id"])
-    return chosen
+    """What --yes installs on a first run: the 2.5D checkpoint with its model
+    support and tools, so a Mac set up without questions can draw at once."""
+    return with_supports(manifest, [*first_run_pack_ids(manifest), YES_BASE], True)
+
+
+def migrated_pack_ids(manifest: dict, state: dict, pack_ids: list[str]) -> list[str]:
+    """Selections saved before the base checkpoints carry onto the new packs.
+    Dreamhex and the Illustrious pieces moved out of Core and the MOSS packs were
+    split; the files never moved on disk, so nothing downloads again. A record
+    exists only for components a chosen pack holds (see main), so a pack dropped
+    on a later run is never brought back here."""
+    renamed = {"moss-image": ["base-aio", "moss"], "moss-image-lite": ["base-aio-lite", "moss-lite"]}
+    out = [new for pack_id in pack_ids for new in renamed.get(pack_id, [pack_id])]
+    recorded = state["components"]
+    if "base-2-5d" not in out and "model-checkpoint-dreamhex-v5" in recorded:
+        out.append("base-2-5d")
+    if "illustrious" not in out and "model-ipadapter-noob" in recorded:
+        out.append("illustrious")
+    known = {pack["id"] for pack in manifest["packs"]}
+    return [pack_id for pack_id in dict.fromkeys(out) if pack_id in known]
+
+
+def works_with_text(manifest: dict, pack: dict) -> str:
+    """A tool names the models it works with."""
+    labels = {item["id"]: item["label"] for item in manifest["packs"]}
+    models = [re.sub(r"\s+support\b", "", labels.get(need, need)) for need in pack.get("worksWith") or []]
+    return f" Works with {' or '.join(models)}." if models else ""
 
 
 def console_picker(manifest: dict, components: dict[str, dict], root: Path, selected: list[str], allow_folder: bool) -> tuple[Path, list[str]]:
     info("Choose what to install (Enter keeps the shown answer).")
+    first_run = allow_folder
     chosen: list[str] = []
     for pack in manifest["packs"]:
-        size = format_size(pack_download_bytes(pack, components))
         if pack.get("required"):
-            print(f"  [x] {pack['label']} ({size}) - required", flush=True)
+            print(f"  [x] {pack['label']} ({format_size(pack_download_bytes(pack, components))}) - required", flush=True)
             if pack.get("description"):
                 print(f"      {pack['description']}", flush=True)
             chosen.append(pack["id"])
+
+    # Base checkpoints: one or more by number, or 0 to bring your own.
+    bases = [pack for pack in manifest["packs"] if pack.get("tier") == "base" and pack["components"]]
+    if bases:
+        print("  Base checkpoints (pick one or more, or 0 for none and bring your own):", flush=True)
+        for number, pack in enumerate(bases, 1):
+            print(f"    {number}) {pack['label']} ({format_size(pack_download_bytes(pack, components))}) - {pack.get('description', '')}", flush=True)
+        picked = [str(number) for number, pack in enumerate(bases, 1) if pack["id"] in selected]
+        default = ",".join(picked) if picked else ("" if first_run else "0")
+        while True:
+            answer = input(f"  Base checkpoints [{default}] ").strip() or default
+            numbers = [part for part in re.split(r"[,\s]+", answer) if part]
+            if numbers == ["0"]:
+                break
+            if numbers and all(part.isdigit() and 1 <= int(part) <= len(bases) for part in numbers):
+                chosen.extend(bases[int(part) - 1]["id"] for part in numbers)
+                break
+            print("  Type the numbers of the checkpoints you want, separated by commas, or 0 for none.", flush=True)
+    # Each checkpoint brings the model support it runs on.
+    supports = {need for pack in manifest["packs"] if pack["id"] in chosen for need in pack.get("worksWith") or []}
+
+    for pack in manifest["packs"]:
+        if pack.get("required") or pack.get("tier") == "base" or not pack["components"]:
+            continue
+        size = format_size(pack_download_bytes(pack, components))
+        if pack["id"] in supports:
+            print(f"  [x] {pack['label']} ({size}) - your checkpoint runs on it", flush=True)
+            chosen.append(pack["id"])
             continue
         if pack.get("description"):
-            print(f"      {pack['description']}", flush=True)
+            print(f"      {pack['description']}{works_with_text(manifest, pack)}", flush=True)
         note = PACK_NOTES.get(pack["id"])
         if note:
             print(f"      Note: {note}", flush=True)
-        default = "Y" if pack["id"] in selected else "N"
-        answer = input(f"  {pack['label']} ({size})? [{default}] ").strip()
-        if not answer:
-            answer = default
-        if answer.lower().startswith("y"):
-            chosen.append(pack["id"])
+        # On a first run the recommended tools made for a picked model come along.
+        for_picked = first_run and pack.get("tier") == "recommended" and any(need in chosen for need in pack.get("worksWith") or [])
+        default = "Y" if pack["id"] in selected or for_picked else "N"
+        answer = input(f"  {pack['label']} ({size})? [{default}] ").strip() or default
+        if not answer.lower().startswith("y"):
+            continue
+        chosen.append(pack["id"])
+        needs = pack.get("worksWith") or []
+        if needs and not any(need in chosen for need in needs):
+            print(f"  [x] {next(item['label'] for item in manifest['packs'] if item['id'] == needs[0])} - {pack['label']} runs on it", flush=True)
+            chosen.append(needs[0])
+    chosen = list(dict.fromkeys(chosen))
     print(flush=True)
     print("ComfyUI itself and PyTorch come from GitHub and PyPI (a few GB), not from the Windows portable zip.", flush=True)
     if allow_folder:
@@ -235,16 +313,18 @@ def resolve_selection(manifest: dict, components: dict[str, dict], args: argpars
         unknown = [pack_id for pack_id in requested if pack_id not in known]
         if unknown:
             die(f"Unknown pack id: {', '.join(unknown)}")
-        selected = list(dict.fromkeys([*required, *requested]))
+        selected = with_supports(manifest, [*required, *requested], False)
         return root, selected
 
-    saved = list(state["packs"])
-    if fresh or not saved:
-        saved = default_pack_ids(manifest)
+    saved = migrated_pack_ids(manifest, state, state["packs"])
     if args.yes or not sys.stdin.isatty():
+        if fresh or not saved:
+            saved = default_pack_ids(manifest)
         if not args.yes:
             info("No interactive terminal. Using the default pack selection. Pass --packs to override.")
         return root, saved
+    if fresh or not saved:
+        saved = first_run_pack_ids(manifest)
     allow_folder = fresh and not args.install_path
     return console_picker(manifest, components, root, saved, allow_folder)
 
@@ -527,8 +607,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-check", action="store_true", help="Fast launch-time update check.")
     parser.add_argument("--no-launch", action="store_true", help="Install or update without starting ComfyUI.")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--yes", action="store_true", help="Accept the default pack selection without prompting.")
-    parser.add_argument("--packs", default="", help="Comma-separated pack ids to install. Required packs are always included.")
+    parser.add_argument("--yes", action="store_true", help="Accept the default pack selection without prompting (on a first run, the 2.5D checkpoint and its tools).")
+    parser.add_argument("--packs", default="", help="Comma-separated pack ids to install. Required packs are always included, and each pack brings the model support it runs on. No base-* pack means you bring your own checkpoint.")
     return parser.parse_args()
 
 
@@ -576,7 +656,7 @@ def main() -> None:
         components_by_id = component_index(manifest)
         root, pack_ids = resolve_selection(manifest, components_by_id, args, root, state, fresh)
     else:
-        pack_ids = list(state["packs"]) or default_pack_ids(manifest)
+        pack_ids = migrated_pack_ids(manifest, state, state["packs"]) or default_pack_ids(manifest)
 
     root.mkdir(parents=True, exist_ok=True)
     if LOG_PATH is None:
@@ -623,6 +703,11 @@ def main() -> None:
 
     state["bundleVersion"] = manifest["bundleVersion"]
     state["packs"] = pack_ids
+    # Only the components the chosen packs hold stay on record. A dropped pack's
+    # files stay on disk, untracked, so a later run never reads them as a choice;
+    # picking the pack again adopts them by hash instead of downloading them.
+    held = {component["id"] for component in components}
+    state["components"] = {key: value for key, value in state["components"].items() if key in held}
     save_state(root, state)
     copy_installer(root)
     write_launchers(root)
