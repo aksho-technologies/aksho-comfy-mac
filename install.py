@@ -199,7 +199,15 @@ def with_supports(manifest: dict, pack_ids: list[str], first_run: bool) -> list[
     made for its model."""
     packs = {pack["id"]: pack for pack in manifest["packs"]}
     chosen = list(dict.fromkeys(pack_ids))
-    for pack_id in list(chosen):
+
+    # Packs whose support is settled go first, so one that names several (MOSS
+    # Turbo) runs on a support already brought in instead of adding another,
+    # whatever order the picks were typed in.
+    def settled(pack_id: str) -> bool:
+        needs = packs.get(pack_id, {}).get("worksWith") or []
+        return len(needs) <= 1 or any(need in chosen for need in needs)
+
+    for pack_id in [p for p in chosen if settled(p)] + [p for p in chosen if not settled(p)]:
         needs = packs.get(pack_id, {}).get("worksWith") or []
         if needs and not any(need in chosen for need in needs):
             chosen.append(needs[0])
